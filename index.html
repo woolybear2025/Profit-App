@@ -1,0 +1,1383 @@
+import { useState, useCallback, useEffect, useRef } from “react”;
+
+// ─── Palette ─────────────────────────────────────────────────────────────────
+const C = {
+lightest:”#ECE9E4”, light:”#D6D3CE”, mid:”#B5BDC5”, deep:”#919BA6”,
+ink:”#2C2C2C”, inkMid:”#555555”, inkFaint:”#888888”, white:”#FAFAF9”,
+danger:”#7A3F3F”, dangerL:”#c4837e”, positive:”#3F5F4A”, positiveL:”#8fba97”,
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+const today = () => new Date().toISOString().slice(0,10);
+const fmtDate = d => d ? d.replace(/-/g,”/”) : “—”;
+const fmtNTD  = n => (n===””||n===null||n===undefined||isNaN(n)) ? “—” : `NT$ ${Number(n).toFixed(0)}`;
+const fmtNTD1 = n => (n===””||n===null||n===undefined||isNaN(n)) ? “—” : `NT$ ${Number(n).toFixed(1)}`;
+
+const CATEGORIES = [“自配糧”,“零食點心”,“墊材”,“玩具”,“其他商品”];
+const UNITS      = [“包”,“罐”,“份”,“盒”,“個”,“kg”,“g”];
+const STORAGE_KEY = “hamster-profit-data-v3”;
+
+// ─── Initial data factories ───────────────────────────────────────────────────
+const mkIng  = () => ({ id:uid(), name:””, url:””, totalGrams:””, totalPrice:””, usedGrams:””, source:“online” });
+const mkProd = () => ({ id:uid(), name:””, category:“自配糧”, ingredients:[mkIng()], packagingCost:””, laborCost:””, outputQty:””, outputUnit:“包”, sellPrice:””, stockTotal:””, stockSold:””, stockNote:”” });
+const mkSale = () => ({ id:uid(), productId:””, qty:””, date:today(), note:””, channel:“直售” });
+const mkRawStock = () => ({ id:uid(), name:””, unit:“g”, totalBought:””, totalPrice:””, currentStock:””, note:””, url:””, source:“online” });
+const mkRevEntry = () => ({ id:uid(), date:today(), category:“鼠鼠販售”, item:””, qty:“1”, unitPrice:””, note:””, type:“income” });
+
+const REV_CATEGORIES = [
+{ label:“鼠鼠販售”,  type:“income”,  },
+{ label:“主食糧”,    type:“income”,  },
+{ label:“零食點心”,  type:“income”,  },
+{ label:“用品墊材”,  type:“income”,  },
+{ label:“其他收入”,  type:“income”,  },
+{ label:“原料支出”,  type:“expense”, },
+{ label:“包材支出”,  type:“expense”, },
+{ label:“其他支出”,  type:“expense”, },
+];
+const INCOME_CATS  = REV_CATEGORIES.filter(c=>c.type===“income”).map(c=>c.label);
+const EXPENSE_CATS = REV_CATEGORIES.filter(c=>c.type===“expense”).map(c=>c.label);
+
+// ─── Calc helpers ─────────────────────────────────────────────────────────────
+function calcIngCost(ing) {
+const tg=parseFloat(ing.totalGrams), tp=parseFloat(ing.totalPrice), ug=parseFloat(ing.usedGrams);
+if(!tg||!tp||!ug||tg===0) return 0;
+return (tp/tg)*ug;
+}
+function calcProd(p) {
+const ingCost = p.ingredients.reduce((s,i)=>s+calcIngCost(i),0);
+const pkg=parseFloat(p.packagingCost)||0, labor=parseFloat(p.laborCost)||0;
+const totalCost=ingCost+pkg+labor, qty=parseFloat(p.outputQty)||1;
+const costPerUnit=qty>0?totalCost/qty:0, sell=parseFloat(p.sellPrice)||0;
+const profitPerUnit=sell-costPerUnit, margin=sell>0?(profitPerUnit/sell)*100:0;
+return {ingCost,totalCost,costPerUnit,profitPerUnit,margin,qty,sell};
+}
+function calcBatch(ingredients) {
+const valid=ingredients.filter(i=>parseFloat(i.totalGrams)>0&&parseFloat(i.usedGrams)>0);
+if(!valid.length) return {maxBatches:0,rows:[]};
+const maxBatches=Math.floor(Math.min(…valid.map(i=>parseFloat(i.totalGrams)/parseFloat(i.usedGrams))));
+const rows=valid.map(i=>{
+const total=parseFloat(i.totalGrams),used=parseFloat(i.usedGrams);
+const consumed=used*maxBatches, remaining=Math.max(0,total-consumed);
+const pricePerG=parseFloat(i.totalPrice)/total;
+return { name:i.name||“未命名原料”, total, used, consumed, remaining,
+needToBuy:Math.max(0,used-remaining), pricePerG:isNaN(pricePerG)?0:pricePerG, url:i.url, source:i.source };
+});
+return {maxBatches,rows};
+}
+
+// ─── Shared UI ────────────────────────────────────────────────────────────────
+const IS = { width:“100%”, padding:“9px 0”, border:“none”, borderRadius:0, borderBottom:`1px solid ${C.light}`, background:“transparent”, fontFamily:”‘Noto Serif TC’,serif”, fontSize:13, color:C.ink, outline:“none”, boxSizing:“border-box”, letterSpacing:“0.02em” };
+
+function Lbl({c,children}){ return <div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,fontWeight:600,letterSpacing:“0.12em”,color:c||C.deep,textTransform:“uppercase”,marginBottom:4}}>{children}</div>; }
+function Fld({label,children,half,style}){ return <div style={{marginBottom:16,width:half?“calc(50% - 8px)”:“100%”,…style}}><Lbl>{label}</Lbl>{children}</div>; }
+function SecH({title}){ return <div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:10,letterSpacing:“0.22em”,color:C.deep,textTransform:“uppercase”,padding:“13px 20px 9px”,background:C.lightest,borderTop:`1px solid ${C.light}`,borderBottom:`1px solid ${C.light}`}}>{title}</div>; }
+function SecB({children,pad}){ return <div style={{padding:pad||“16px 20px”,background:C.white}}>{children}</div>; }
+function Divider(){ return <div style={{height:1,background:C.lightest,margin:“4px 0 16px”}}/>; }
+
+function Grid({items,dark,cols}){
+const n=cols||items.length;
+return (
+<div style={{display:“grid”,gridTemplateColumns:`repeat(${n},1fr)`,border:dark?“1px solid rgba(255,255,255,0.08)”:`1px solid ${C.lightest}`}}>
+{items.map((item,i)=>(
+<div key={i} style={{padding:“9px 11px”,borderRight:i<items.length-1?(dark?“1px solid rgba(255,255,255,0.08)”:`1px solid ${C.lightest}`):“none”}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:dark?C.mid:C.deep,letterSpacing:“0.08em”,textTransform:“uppercase”,marginBottom:3}}>{item.label}</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:item.size||14,color:item.color||(dark?C.lightest:C.ink),lineHeight:1}}>{item.value}</div>
+</div>
+))}
+</div>
+);
+}
+
+function Bar({pct,color}){
+return <div style={{height:2,background:C.lightest,borderRadius:1,overflow:“hidden”,marginBottom:10}}>
+<div style={{height:“100%”,width:`${Math.min(100,Math.max(0,pct))}%`,background:color||C.deep,borderRadius:1}}/>
+
+  </div>;
+}
+
+// ─── Top Bar ──────────────────────────────────────────────────────────────────
+function TopBar({title,sub,saveStatus,onMenu,onBack}){
+return (
+<div style={{position:“sticky”,top:0,zIndex:200,background:C.deep}}>
+<div style={{display:“flex”,alignItems:“center”,justifyContent:“space-between”,padding:“13px 20px”}}>
+<div style={{flex:1,minWidth:0}}>
+{sub && <div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:9,letterSpacing:“0.28em”,color:C.mid,textTransform:“uppercase”,marginBottom:2}}>{sub}</div>}
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:17,fontWeight:700,color:C.lightest,letterSpacing:“0.03em”,lineHeight:1.2,overflow:“hidden”,textOverflow:“ellipsis”,whiteSpace:“nowrap”}}>{title}</div>
+</div>
+<div style={{display:“flex”,gap:12,alignItems:“center”,flexShrink:0}}>
+{saveStatus&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:“rgba(255,255,255,0.45)”,letterSpacing:“0.06em”}}>{saveStatus===“saving”?“儲存中”:“已儲存”}</div>}
+<button onClick={onMenu} style={{background:“none”,border:“none”,cursor:“pointer”,padding:4,display:“flex”,flexDirection:“column”,gap:4}}>
+{[0,1,2].map(i=><div key={i} style={{width:20,height:1.5,background:C.lightest}}/>)}
+</button>
+</div>
+</div>
+{onBack&&<div style={{borderTop:`1px solid rgba(255,255,255,0.1)`,padding:“7px 20px”}}>
+<button onClick={onBack} style={{background:“none”,border:“none”,cursor:“pointer”,fontFamily:”‘Noto Serif TC’,serif”,fontSize:11,color:C.mid,letterSpacing:“0.06em”,padding:0}}>← 返回</button>
+</div>}
+</div>
+);
+}
+
+// ─── Bottom Nav ───────────────────────────────────────────────────────────────
+function BottomNav({nav,onNav}){
+const tabs=[[“products”,“商品”],[“sales”,“銷售”],[“rawstock”,“原料”],[“revenue”,“月結”],[“report”,“報表”]];
+return (
+<div style={{position:“fixed”,bottom:0,left:0,right:0,zIndex:100,background:C.white,borderTop:`1px solid ${C.light}`,display:“flex”}}>
+{tabs.map(([key,label])=>(
+<button key={key} onClick={()=>onNav(key)} style={{flex:1,padding:“11px 0 9px”,border:“none”,background:“transparent”,cursor:“pointer”,borderTop:`2px solid ${nav===key?C.deep:"transparent"}`}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,fontWeight:nav===key?700:400,color:nav===key?C.ink:C.inkFaint,letterSpacing:“0.04em”}}>{label}</div>
+</button>
+))}
+</div>
+);
+}
+
+// ─── Hamburger Menu ───────────────────────────────────────────────────────────
+function HamburgerMenu({nav,onNav,onAdd,onClose}){
+const items=[
+{key:“products”,label:“商品管理”,sub:“商品列表、成本與利潤設定”},
+{key:“sales”,label:“銷售紀錄”,sub:“每筆訂單、每日每月銷售統計”},
+{key:“rawstock”,label:“原料庫存”,sub:“原料購入、剩餘量管理”},
+{key:“dashboard”,label:“庫存統整”,sub:“商品庫存數量與銷售狀況”},
+{key:“revenue”,label:“月結營業額”,sub:“月收入、年收入結算與匯出”},
+{key:“report”,label:“損益報表”,sub:“成本利潤總覽與匯出”},
+];
+return (
+<div style={{position:“fixed”,inset:0,zIndex:300}}>
+<div onClick={onClose} style={{position:“absolute”,inset:0,background:“rgba(44,44,44,0.45)”}}/>
+<div style={{position:“absolute”,top:0,right:0,width:260,height:“100%”,background:C.white,display:“flex”,flexDirection:“column”,overflowY:“auto”}}>
+<div style={{background:C.deep,padding:“20px 20px 16px”}}>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:9,letterSpacing:“0.28em”,color:C.mid,textTransform:“uppercase”,marginBottom:4}}>Rodent Atelier</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:15,fontWeight:700,color:C.lightest}}>功能選單</div>
+</div>
+{items.map(item=>(
+<button key={item.key} onClick={()=>{onNav(item.key);onClose();}} style={{display:“block”,width:“100%”,padding:“15px 20px”,background:nav===item.key?C.lightest:“transparent”,border:“none”,borderBottom:`1px solid ${C.lightest}`,cursor:“pointer”,textAlign:“left”}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:13,fontWeight:700,color:nav===item.key?C.ink:C.inkMid,marginBottom:2}}>{item.label}</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,color:C.inkFaint,letterSpacing:“0.03em”}}>{item.sub}</div>
+</button>
+))}
+<div style={{flex:1}}/>
+<button onClick={()=>{onAdd();onClose();}} style={{margin:16,padding:“11px 0”,background:C.deep,border:“none”,color:C.lightest,fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,fontWeight:700,letterSpacing:“0.08em”,cursor:“pointer”}}>
++ 新增商品
+</button>
+</div>
+</div>
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═════════════════════════════════════════════════════════════════════════════
+export default function App(){
+const [products,setProducts]   = useState([mkProd()]);
+const [sales,setSales]         = useState([]);
+const [rawStocks,setRawStocks] = useState([]);
+const [revEntries,setRevEntries] = useState([]);
+const [loaded,setLoaded]       = useState(false);
+const [saveStatus,setSave]     = useState(””);
+const [nav,setNav]             = useState(“products”);
+const [menuOpen,setMenuOpen]   = useState(false);
+const [selectedProd,setSelProd]= useState(null);  // product id
+const [prodTab,setProdTab]     = useState(“info”);
+const saveTimer = useRef(null);
+
+// ── Persistence ────────────────────────────────────────────────────────────
+useEffect(()=>{
+(async()=>{
+try{
+const r=await window.storage.get(STORAGE_KEY);
+if(r?.value){
+const d=JSON.parse(r.value);
+if(d.products?.length) setProducts(d.products); else setProducts([mkProd()]);
+if(d.sales?.length)    setSales(d.sales);
+if(d.rawStocks?.length) setRawStocks(d.rawStocks);
+if(d.revEntries?.length) setRevEntries(d.revEntries);
+} else setProducts([mkProd()]);
+} catch{ setProducts([mkProd()]); }
+setLoaded(true);
+})();
+},[]);
+
+useEffect(()=>{
+if(!loaded) return;
+setSave(“saving”);
+if(saveTimer.current) clearTimeout(saveTimer.current);
+saveTimer.current=setTimeout(async()=>{
+try{
+await window.storage.set(STORAGE_KEY,JSON.stringify({products,sales,rawStocks,revEntries}));
+setSave(“saved”); setTimeout(()=>setSave(””),1800);
+} catch{ setSave(””); }
+},700);
+},[products,sales,rawStocks,revEntries,loaded]);
+
+// ── Product CRUD ───────────────────────────────────────────────────────────
+const updProd = useCallback((id,patch)=>setProducts(ps=>ps.map(p=>p.id===id?{…p,…patch}:p)),[]);
+const updIng  = (pid,iid,patch)=>setProducts(ps=>ps.map(p=>p.id===pid?{…p,ingredients:p.ingredients.map(i=>i.id===iid?{…i,…patch}:i)}:p));
+const addIng  = pid=>setProducts(ps=>ps.map(p=>p.id===pid?{…p,ingredients:[…p.ingredients,mkIng()]}:p));
+const delIng  = (pid,iid)=>setProducts(ps=>ps.map(p=>p.id===pid?{…p,ingredients:p.ingredients.filter(i=>i.id!==iid)}:p));
+const addProd = ()=>{ const np=mkProd(); setProducts(ps=>[…ps,np]); setSelProd(np.id); setProdTab(“info”); setNav(“products”); };
+const delProd = id=>{ setProducts(ps=>{ const nx=ps.filter(p=>p.id!==id); return nx.length?nx:[mkProd()]; }); setSelProd(null); };
+
+// ── Sales CRUD ─────────────────────────────────────────────────────────────
+const addSale = (s)=>setSales(ss=>[{…mkSale(),…s},  …ss]);
+const delSale = id=>setSales(ss=>ss.filter(s=>s.id!==id));
+
+// ── Raw Stock CRUD ─────────────────────────────────────────────────────────
+const addRaw = ()=>setRawStocks(rs=>[…rs,mkRawStock()]);
+const updRaw = (id,patch)=>setRawStocks(rs=>rs.map(r=>r.id===id?{…r,…patch}:r));
+const delRaw = id=>setRawStocks(rs=>rs.filter(r=>r.id!==id));
+
+// ── Revenue Entries CRUD ──────────────────────────────────────────────────
+const addRevEntry = e=>setRevEntries(rs=>[{…mkRevEntry(),…e},…rs]);
+const delRevEntry = id=>setRevEntries(rs=>rs.filter(r=>r.id!==id));
+
+const goNav = n=>{ setNav(n); setMenuOpen(false); setSelProd(null); };
+
+if(!loaded) return (
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,background:C.lightest,minHeight:“100vh”,display:“flex”,alignItems:“center”,justifyContent:“center”,flexDirection:“column”,gap:12}}>
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Noto+Serif+TC:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:11,letterSpacing:“0.3em”,color:C.deep,textTransform:“uppercase”}}>Rodent Atelier</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,color:C.mid}}>載入中⋯</div>
+</div>
+);
+
+const activeProd = products.find(p=>p.id===selectedProd);
+
+return (
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,background:C.lightest,minHeight:“100vh”,color:C.ink}}>
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Noto+Serif+TC:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>{`*{box-sizing:border-box}input::placeholder{color:${C.light}}input:focus,select:focus{border-bottom-color:${C.deep}!important;outline:none}@media print{.no-print{display:none!important}.print-only{display:block!important}}`}</style>
+
+```
+  <TopBar
+    title={activeProd&&nav==="products" ? activeProd.name||"未命名商品" : {products:"商品管理",sales:"銷售紀錄",rawstock:"原料庫存",dashboard:"庫存統整",revenue:"月結營業額",report:"損益報表"}[nav]}
+    sub={activeProd&&nav==="products" ? activeProd.category : "Rodent Atelier"}
+    saveStatus={saveStatus}
+    onMenu={()=>setMenuOpen(o=>!o)}
+    onBack={activeProd&&nav==="products" ? ()=>setSelProd(null) : null}
+  />
+
+  {menuOpen && <HamburgerMenu nav={nav} onNav={goNav} onAdd={addProd} onClose={()=>setMenuOpen(false)}/>}
+
+  <div style={{paddingBottom:80}} id="print-area">
+    {nav==="products"&&!activeProd && <ProductList products={products} sales={sales} onSelect={id=>{setSelProd(id);setProdTab("info");}} onAdd={addProd}/>}
+    {nav==="products"&&activeProd  && <ProductDetail product={activeProd} prodTab={prodTab} setProdTab={setProdTab} sales={sales} updProd={updProd} updIng={updIng} addIng={addIng} delIng={delIng} delProd={delProd} canDelete={products.length>1}/>}
+    {nav==="sales"   && <SalesPage products={products} sales={sales} addSale={addSale} delSale={delSale}/>}
+    {nav==="rawstock"&& <RawStockPage rawStocks={rawStocks} addRaw={addRaw} updRaw={updRaw} delRaw={delRaw}/>}
+    {nav==="dashboard"&&<DashboardPage products={products} sales={sales} onSelect={id=>{setSelProd(id);setNav("products");setProdTab("info");}}/>}
+    {nav==="revenue" && <RevenuePage revEntries={revEntries} addRevEntry={addRevEntry} delRevEntry={delRevEntry}/>}
+    {nav==="report"  && <ReportPage products={products} sales={sales} revEntries={revEntries}/>}
+  </div>
+
+  <BottomNav nav={nav} onNav={goNav}/>
+</div>
+```
+
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PRODUCT LIST
+// ═════════════════════════════════════════════════════════════════════════════
+function ProductList({products,sales,onSelect,onAdd}){
+const [filter,setFilter]=useState(“全部”);
+const cats=[“全部”,…CATEGORIES.filter(c=>products.some(p=>p.category===c))];
+const list=filter===“全部”?products:products.filter(p=>p.category===filter);
+return (
+<div>
+<div style={{overflowX:“auto”,background:C.light,borderBottom:`1px solid ${C.mid}`}}>
+<div style={{display:“flex”,minWidth:“max-content”,padding:“0 16px”}}>
+{cats.map(c=>(
+<button key={c} onClick={()=>setFilter(c)} style={{padding:“10px 14px”,border:“none”,background:“transparent”,fontFamily:”‘Noto Serif TC’,serif”,fontSize:11,fontWeight:filter===c?700:400,color:filter===c?C.ink:C.deep,borderBottom:`2px solid ${filter===c?C.ink:"transparent"}`,cursor:“pointer”,whiteSpace:“nowrap”,letterSpacing:“0.04em”}}>{c}</button>
+))}
+</div>
+</div>
+{list.map((p,i)=>{
+const s=calcProd(p);
+const prodSales=sales.filter(sl=>sl.productId===p.id);
+const totalSoldQty=prodSales.reduce((a,sl)=>a+(parseFloat(sl.qty)||0),0);
+const totalSoldRev=totalSoldQty*(parseFloat(p.sellPrice)||0);
+const stock=parseFloat(p.stockTotal)||0;
+const rem=stock-totalSoldQty;
+const lowStock=stock>0&&rem<=3;
+return (
+<div key={p.id} onClick={()=>onSelect(p.id)} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,cursor:“pointer”,padding:“15px 20px”}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“flex-start”,marginBottom:10}}>
+<div style={{flex:1,minWidth:0}}>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:9,letterSpacing:“0.16em”,color:C.deep,textTransform:“uppercase”,marginBottom:2}}>{String(i+1).padStart(2,“0”)} — {p.category}</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:15,fontWeight:700,marginBottom:2}}>{p.name||“未命名商品”}</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,color:C.inkFaint}}>{p.outputQty||”—”} {p.outputUnit}{p.sellPrice?`　NT$ ${p.sellPrice} / ${p.outputUnit}`:””}</div>
+</div>
+<div style={{textAlign:“right”,marginLeft:12,flexShrink:0}}>
+{p.sellPrice&&p.outputQty&&<>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.deep,letterSpacing:“0.08em”,textTransform:“uppercase”,marginBottom:2}}>毛利</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:20,lineHeight:1,color:s.profitPerUnit>0?C.positive:s.profitPerUnit<0?C.danger:C.inkFaint}}>{s.profitPerUnit>0?”+”:””}{fmtNTD1(s.profitPerUnit)}</div>
+</>}
+{stock>0&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:lowStock?C.dangerL:C.deep,marginTop:4}}>{rem<=0?“已售罄”:lowStock?`剩 ${rem} ${p.outputUnit}（偏低）`:`剩 ${rem} ${p.outputUnit}`}</div>}
+</div>
+</div>
+<Grid items={[
+{label:“單件成本”, value:fmtNTD1(s.costPerUnit)},
+{label:“利潤率”,   value:isNaN(s.margin)?”—”:`${s.margin.toFixed(1)}%`, color:s.margin>=20?C.positive:s.margin<0?C.danger:C.ink},
+{label:“已售數量”, value:totalSoldQty>0?`${totalSoldQty} ${p.outputUnit}`:”—”},
+{label:“已售金額”, value:totalSoldRev>0?fmtNTD(totalSoldRev):”—”},
+]}/>
+</div>
+);
+})}
+<div style={{padding:20}}>
+<button onClick={onAdd} style={{width:“100%”,padding:12,border:`1px solid ${C.light}`,background:“transparent”,fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,fontWeight:700,color:C.deep,letterSpacing:“0.08em”,cursor:“pointer”}}>+ 新增商品</button>
+</div>
+</div>
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PRODUCT DETAIL
+// ═════════════════════════════════════════════════════════════════════════════
+function ProductDetail({product:p,prodTab,setProdTab,sales,updProd,updIng,addIng,delIng,delProd,canDelete}){
+const s=calcProd(p);
+const {maxBatches,rows}=calcBatch(p.ingredients);
+const needRestock=rows.filter(r=>r.needToBuy>0);
+const prodSales=sales.filter(sl=>sl.productId===p.id);
+const totalSoldQty=prodSales.reduce((a,sl)=>a+(parseFloat(sl.qty)||0),0);
+
+return (
+<div>
+<div style={{display:“flex”,background:C.light,borderBottom:`1px solid ${C.mid}`}}>
+{[[“info”,“商品資訊”],[“batch”,“製作計算”],[“history”,“銷售明細”]].map(([key,label])=>(
+<button key={key} onClick={()=>setProdTab(key)} style={{flex:1,padding:“11px 0”,border:“none”,background:“transparent”,fontFamily:”‘Noto Serif TC’,serif”,fontSize:11,fontWeight:prodTab===key?700:400,color:prodTab===key?C.ink:C.deep,borderBottom:`2px solid ${prodTab===key?C.ink:"transparent"}`,cursor:“pointer”,letterSpacing:“0.05em”}}>{label}</button>
+))}
+</div>
+
+```
+  {/* ── INFO TAB ── */}
+  {prodTab==="info"&&<div>
+    <SecH title="Basic — 商品設定"/>
+    <SecB>
+      <Fld label="商品名稱"><input style={IS} placeholder="例：御用自配糧 100g" value={p.name} onChange={e=>updProd(p.id,{name:e.target.value})}/></Fld>
+      <Fld label="商品類別"><select style={{...IS,appearance:"none",cursor:"pointer"}} value={p.category} onChange={e=>updProd(p.id,{category:e.target.value})}>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></Fld>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <Fld label="製作數量">
+          <div style={{display:"flex",gap:6,alignItems:"flex-end"}}>
+            <input style={{...IS,flex:1}} type="number" placeholder="10" value={p.outputQty} onChange={e=>updProd(p.id,{outputQty:e.target.value})}/>
+            <select style={{...IS,width:52,paddingLeft:0}} value={p.outputUnit} onChange={e=>updProd(p.id,{outputUnit:e.target.value})}>{UNITS.map(u=><option key={u}>{u}</option>)}</select>
+          </div>
+        </Fld>
+        <Fld label="單件售價 NT$"><input style={IS} type="number" placeholder="150" value={p.sellPrice} onChange={e=>updProd(p.id,{sellPrice:e.target.value})}/></Fld>
+      </div>
+      <Divider/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <Fld label={`現有庫存 (${p.outputUnit})`}><input style={IS} type="number" placeholder="0" value={p.stockTotal} onChange={e=>updProd(p.id,{stockTotal:e.target.value})}/></Fld>
+        <Fld label="備註"><input style={IS} placeholder="例：冷凍保存" value={p.stockNote} onChange={e=>updProd(p.id,{stockNote:e.target.value})}/></Fld>
+      </div>
+      {(parseFloat(p.stockTotal)>0||totalSoldQty>0)&&(
+        <div style={{background:C.lightest,padding:"10px 14px",marginTop:-8,marginBottom:16}}>
+          <Grid items={[
+            {label:"庫存總量",  value:`${parseFloat(p.stockTotal)||0} ${p.outputUnit}`},
+            {label:"已售數量",  value:`${totalSoldQty} ${p.outputUnit}`},
+            {label:"剩餘庫存",  value:`${(parseFloat(p.stockTotal)||0)-totalSoldQty} ${p.outputUnit}`},
+            {label:"已售金額",  value:totalSoldQty&&p.sellPrice?fmtNTD(totalSoldQty*(parseFloat(p.sellPrice)||0)):"—"},
+          ]}/>
+        </div>
+      )}
+    </SecB>
+
+    <SecH title="Ingredients — 原料清單"/>
+    <SecB>
+      {p.ingredients.map((ing,idx)=>(
+        <div key={ing.id} style={{marginBottom:22,paddingBottom:22,borderBottom:`1px solid ${C.lightest}`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.16em",color:C.deep,textTransform:"uppercase"}}>Ingredient {String(idx+1).padStart(2,"0")}</div>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <div style={{display:"flex",border:`1px solid ${C.light}`}}>
+                {[["online","網購"],["offline","實體"]].map(([v,l])=>(
+                  <button key={v} onClick={()=>updIng(p.id,ing.id,{source:v})} style={{padding:"4px 10px",border:"none",background:ing.source===v?C.deep:"transparent",color:ing.source===v?C.lightest:C.deep,fontFamily:"'Noto Serif TC',serif",fontSize:10,fontWeight:600,cursor:"pointer"}}>{l}</button>
+                ))}
+              </div>
+              {p.ingredients.length>1&&<button onClick={()=>delIng(p.id,ing.id)} style={{background:"none",border:"none",color:C.mid,cursor:"pointer",fontFamily:"'Crimson Text',serif",fontSize:18,padding:0,lineHeight:1}}>×</button>}
+            </div>
+          </div>
+          <Fld label="原料名稱"><input style={IS} placeholder="燕麥片、葵花籽等" value={ing.name} onChange={e=>updIng(p.id,ing.id,{name:e.target.value})}/></Fld>
+          {ing.source==="online"&&<Fld label="購買連結"><input style={IS} placeholder="https://..." value={ing.url} onChange={e=>updIng(p.id,ing.id,{url:e.target.value})}/></Fld>}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Fld label="購買總量 g"><input style={IS} type="number" placeholder="1000" value={ing.totalGrams} onChange={e=>updIng(p.id,ing.id,{totalGrams:e.target.value})}/></Fld>
+            <Fld label="購買金額 NT$"><input style={IS} type="number" placeholder="200" value={ing.totalPrice} onChange={e=>updIng(p.id,ing.id,{totalPrice:e.target.value})}/></Fld>
+          </div>
+          <Fld label="本配方用量 g"><input style={IS} type="number" placeholder="50" value={ing.usedGrams} onChange={e=>updIng(p.id,ing.id,{usedGrams:e.target.value})}/></Fld>
+          {(()=>{
+            const total=parseFloat(ing.totalGrams),used=parseFloat(ing.usedGrams);
+            if(!total||!used) return null;
+            const batchCount=Math.floor(total/used), rem=total-used*batchCount, short=rem<used;
+            const pricePerG=parseFloat(ing.totalPrice)/total;
+            const pct=Math.max(0,Math.min(100,(rem/total)*100));
+            return (
+              <div style={{background:C.lightest,padding:"10px 12px",marginTop:4}}>
+                <Bar pct={pct} color={pct>25?C.deep:C.dangerL}/>
+                <Grid items={[
+                  {label:"可做批次",   value:`${batchCount} 批`},
+                  {label:"做完後剩餘", value:`${rem.toFixed(1)} g`},
+                  {label:"下批缺口",   value:short?`${(used-rem).toFixed(1)} g`:"足夠", color:short?C.dangerL:C.positive},
+                ]}/>
+                {short&&<div style={{marginTop:8,fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.dangerL,lineHeight:1.7}}>
+                  需補購 {(used-rem).toFixed(1)} g{!isNaN(pricePerG)&&pricePerG>0?`，預估費用 NT$ ${((used-rem)*pricePerG).toFixed(1)}`:""}
+                  {ing.source==="online"&&ing.url&&<> &nbsp;·&nbsp; <a href={ing.url} target="_blank" rel="noopener noreferrer" style={{color:C.deep,textDecoration:"underline"}}>前往購買</a></>}
+                </div>}
+                {calcIngCost(ing)>0&&<div style={{fontFamily:"'Crimson Text',serif",fontSize:12,color:C.deep,letterSpacing:"0.06em",marginTop:8}}>此原料成本 / 批次 — {fmtNTD1(calcIngCost(ing))}</div>}
+              </div>
+            );
+          })()}
+        </div>
+      ))}
+      <button onClick={()=>addIng(p.id)} style={{width:"100%",padding:"10px 0",border:`1px solid ${C.light}`,background:"transparent",color:C.deep,fontFamily:"'Noto Serif TC',serif",fontWeight:600,fontSize:12,cursor:"pointer",letterSpacing:"0.1em"}}>+ 新增原料</button>
+    </SecB>
+
+    <SecH title="Other Costs — 其他費用"/>
+    <SecB>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <Fld label="包材費用 NT$"><input style={IS} type="number" placeholder="30" value={p.packagingCost} onChange={e=>updProd(p.id,{packagingCost:e.target.value})}/></Fld>
+        <Fld label="人工費用 NT$"><input style={IS} type="number" placeholder="50" value={p.laborCost} onChange={e=>updProd(p.id,{laborCost:e.target.value})}/></Fld>
+      </div>
+    </SecB>
+
+    <div style={{background:C.ink}}>
+      <div style={{padding:"12px 20px 8px",borderBottom:"1px solid rgba(255,255,255,0.08)",fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.24em",color:C.mid,textTransform:"uppercase"}}>Profit Analysis — 利潤分析</div>
+      <Grid dark items={[{label:"原料成本",value:fmtNTD1(s.ingCost)},{label:"單件成本",value:fmtNTD1(s.costPerUnit)},{label:"單件售價",value:fmtNTD1(s.sell)}]}/>
+      <div style={{padding:"16px 20px 18px",borderTop:"1px solid rgba(255,255,255,0.08)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:14}}>
+          <div><div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.1em",color:C.mid,textTransform:"uppercase",marginBottom:5}}>單件毛利</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:32,lineHeight:1,color:s.profitPerUnit>0?C.positiveL:s.profitPerUnit<0?C.dangerL:C.mid}}>{fmtNTD1(s.profitPerUnit)}</div></div>
+          <div style={{textAlign:"right"}}><div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.1em",color:C.mid,textTransform:"uppercase",marginBottom:5}}>利潤率</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:32,lineHeight:1,color:s.margin>0?C.positiveL:s.margin<0?C.dangerL:C.mid}}>{isNaN(s.margin)?"—":`${s.margin.toFixed(1)}%`}</div></div>
+        </div>
+        <div style={{height:1,background:"rgba(255,255,255,0.08)",marginBottom:14}}/>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,color:C.mid}}>全批次毛利（{p.outputQty||"—"} {p.outputUnit}）</div>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:20,color:s.profitPerUnit*s.qty>0?C.positiveL:s.profitPerUnit*s.qty<0?C.dangerL:C.mid}}>{fmtNTD1(s.profitPerUnit*s.qty)}</div>
+        </div>
+        {s.profitPerUnit<0&&<div style={{marginTop:12,padding:"9px 12px",border:"1px solid rgba(196,131,126,0.25)",fontSize:11,color:C.dangerL,fontFamily:"'Noto Serif TC',serif",lineHeight:1.6}}>目前每{p.outputUnit}虧損 {fmtNTD1(Math.abs(s.profitPerUnit))}，建議調整售價或降低成本。</div>}
+      </div>
+    </div>
+    {canDelete&&<div style={{padding:20}}><button onClick={()=>delProd(p.id)} style={{width:"100%",padding:10,border:`1px solid ${C.light}`,background:"transparent",color:C.inkFaint,fontFamily:"'Noto Serif TC',serif",fontSize:11,cursor:"pointer",letterSpacing:"0.08em"}}>刪除此商品</button></div>}
+  </div>}
+
+  {/* ── BATCH TAB ── */}
+  {prodTab==="batch"&&<div>
+    <div style={{background:C.ink,padding:"20px 20px 18px"}}>
+      <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.24em",color:C.mid,textTransform:"uppercase",marginBottom:10}}>Batch Capacity — 可製作批次</div>
+      {rows.length>0?<>
+        <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:8}}>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:52,lineHeight:1,color:C.lightest}}>{maxBatches}</div>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:14,color:C.mid}}>批次</div>
+        </div>
+        <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,color:C.mid,lineHeight:1.7}}>以目前庫存最多可完整製作 {maxBatches} 批次{p.outputQty?`，共產出 ${maxBatches*parseFloat(p.outputQty)} ${p.outputUnit}`:""}</div>
+      </>:<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,color:C.mid}}>請先在「商品資訊」填寫原料的購買總量與配方用量。</div>}
+    </div>
+    {rows.length>0&&<>
+      <SecH title="Ingredient Stock — 各原料剩餘"/>
+      <SecB>
+        {rows.map((r,i)=>{
+          const pct=Math.max(0,Math.min(100,(r.remaining/r.total)*100));
+          return (
+            <div key={i} style={{marginBottom:20,paddingBottom:20,borderBottom:i<rows.length-1?`1px solid ${C.lightest}`:"none"}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+                <div><div style={{fontFamily:"'Crimson Text',serif",fontSize:9,letterSpacing:"0.14em",color:C.deep,textTransform:"uppercase",marginBottom:2}}>Ingredient {String(i+1).padStart(2,"0")}</div>
+                  <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:14,fontWeight:700}}>{r.name}</div></div>
+                <div style={{textAlign:"right"}}><div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.deep,textTransform:"uppercase",marginBottom:2}}>每批用量</div>
+                  <div style={{fontFamily:"'Crimson Text',serif",fontSize:16}}>{r.used} g</div></div>
+              </div>
+              <Bar pct={pct} color={pct>30?C.deep:C.dangerL}/>
+              <Grid items={[{label:"購買總量",value:`${r.total} g`},{label:`${maxBatches}批消耗`,value:`${r.consumed} g`},{label:"剩餘庫存",value:`${r.remaining.toFixed(1)} g`,color:r.remaining<r.used?C.dangerL:C.positive}]}/>
+            </div>
+          );
+        })}
+      </SecB>
+      <SecH title="Next Purchase — 補購清單"/>
+      <SecB>
+        {needRestock.length===0?<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,color:C.positive,lineHeight:1.8}}>做完 {maxBatches} 批後所有原料仍足夠，暫時不需補購。</div>:<>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,color:C.inkFaint,lineHeight:1.7,marginBottom:14}}>做完 {maxBatches} 批後，以下原料需補購：</div>
+          {needRestock.map((r,i)=>(
+            <div key={i} style={{marginBottom:12,padding:"13px 14px",background:C.lightest,borderLeft:`3px solid ${C.deep}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:13,fontWeight:700}}>{r.name}</div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:13,color:C.dangerL}}>缺 {r.needToBuy.toFixed(1)} g</div>
+              </div>
+              <Grid items={[{label:"剩餘庫存",value:`${r.remaining.toFixed(1)} g`},{label:"預估費用",value:r.pricePerG>0?`NT$ ${(r.needToBuy*r.pricePerG).toFixed(1)}`:"—"}]}/>
+              {r.source==="online"&&r.url&&<a href={r.url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",marginTop:8,fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.deep,textDecoration:"underline"}}>前往購買連結</a>}
+            </div>
+          ))}
+          <div style={{marginTop:10,padding:"12px 14px",background:C.ink}}>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.mid,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:4}}>預估補購總費用</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:22,color:C.lightest}}>NT$ {needRestock.reduce((s,r)=>s+r.needToBuy*r.pricePerG,0).toFixed(1)}</div>
+          </div>
+        </>}
+      </SecB>
+    </>}
+  </div>}
+
+  {/* ── HISTORY TAB ── */}
+  {prodTab==="history"&&<div>
+    <SecH title="Sales History — 此商品銷售明細"/>
+    <SecB>
+      {prodSales.length===0?<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,color:C.inkFaint,lineHeight:1.8}}>此商品尚無銷售紀錄。請至「銷售紀錄」頁面新增。</div>:<>
+        <Grid items={[
+          {label:"總售出",   value:`${totalSoldQty} ${p.outputUnit}`},
+          {label:"總銷售額", value:fmtNTD(totalSoldQty*(parseFloat(p.sellPrice)||0))},
+          {label:"總毛利",   value:fmtNTD(totalSoldQty*s.profitPerUnit), color:s.profitPerUnit>0?C.positive:s.profitPerUnit<0?C.danger:C.ink},
+        ]}/>
+        <div style={{height:1,background:C.lightest,margin:"14px 0"}}/>
+        {prodSales.map(sl=>(
+          <div key={sl.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.lightest}`}}>
+            <div>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,fontWeight:700}}>{fmtDate(sl.date)}</div>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.inkFaint,marginTop:2}}>{sl.channel}{sl.note?` · ${sl.note}`:""}</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontFamily:"'Crimson Text',serif",fontSize:18,color:C.ink}}>{sl.qty} {p.outputUnit}</div>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.deep}}>{fmtNTD((parseFloat(sl.qty)||0)*(parseFloat(p.sellPrice)||0))}</div>
+            </div>
+          </div>
+        ))}
+      </>}
+    </SecB>
+  </div>}
+</div>
+```
+
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SALES PAGE
+// ═════════════════════════════════════════════════════════════════════════════
+function SalesPage({products,sales,addSale,delSale}){
+const [form,setForm]=useState({productId:””,qty:””,date:today(),note:””,channel:“直售”});
+const [view,setView]=useState(“list”); // list | monthly
+const [confirmDel,setConfirmDel]=useState(null);
+const CHANNELS=[“直售”,“網路”,“市集”,“其他”];
+
+const sortedSales=[…sales].sort((a,b)=>b.date.localeCompare(a.date));
+
+// group by month
+const byMonth={};
+sortedSales.forEach(s=>{
+const m=s.date.slice(0,7);
+if(!byMonth[m]) byMonth[m]=[];
+byMonth[m].push(s);
+});
+
+const getProd=id=>products.find(p=>p.id===id);
+const getRevenue=(s)=>{
+const p=getProd(s.productId);
+return (parseFloat(s.qty)||0)*(parseFloat(p?.sellPrice)||0);
+};
+const getProfit=(s)=>{
+const p=getProd(s.productId);
+if(!p) return 0;
+return (parseFloat(s.qty)||0)*calcProd(p).profitPerUnit;
+};
+
+const totalRev=sortedSales.reduce((a,s)=>a+getRevenue(s),0);
+const totalPro=sortedSales.reduce((a,s)=>a+getProfit(s),0);
+
+const handleAdd=()=>{
+if(!form.productId||!form.qty||!form.date) return;
+addSale(form);
+setForm({productId:””,qty:””,date:today(),note:””,channel:“直售”});
+};
+
+return (
+<div>
+{/* Add form */}
+<SecH title="New Sale — 新增銷售紀錄"/>
+<SecB>
+<Fld label="商品">
+<select style={{…IS,appearance:“none”,cursor:“pointer”}} value={form.productId} onChange={e=>setForm(f=>({…f,productId:e.target.value}))}>
+<option value="">請選擇商品</option>
+{products.map(p=><option key={p.id} value={p.id}>{p.name||“未命名商品”}</option>)}
+</select>
+</Fld>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:16}}>
+<Fld label="數量">
+<div style={{display:“flex”,gap:6,alignItems:“flex-end”}}>
+<input style={{…IS,flex:1}} type=“number” placeholder=“1” value={form.qty} onChange={e=>setForm(f=>({…f,qty:e.target.value}))}/>
+<span style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,color:C.inkFaint,paddingBottom:9}}>{getProd(form.productId)?.outputUnit||””}</span>
+</div>
+</Fld>
+<Fld label="日期"><input style={IS} type=“date” value={form.date} onChange={e=>setForm(f=>({…f,date:e.target.value}))}/></Fld>
+</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:16}}>
+<Fld label="銷售管道">
+<select style={{…IS,appearance:“none”,cursor:“pointer”}} value={form.channel} onChange={e=>setForm(f=>({…f,channel:e.target.value}))}>
+{CHANNELS.map(c=><option key={c}>{c}</option>)}
+</select>
+</Fld>
+<Fld label="備註"><input style={IS} placeholder=“選填” value={form.note} onChange={e=>setForm(f=>({…f,note:e.target.value}))}/></Fld>
+</div>
+{form.productId&&form.qty&&(()=>{
+const p=getProd(form.productId);
+if(!p) return null;
+const rev=(parseFloat(form.qty)||0)*(parseFloat(p.sellPrice)||0);
+const profit=(parseFloat(form.qty)||0)*calcProd(p).profitPerUnit;
+return <div style={{background:C.lightest,padding:“10px 14px”,marginTop:-8,marginBottom:8}}>
+<Grid items={[{label:“銷售金額”,value:fmtNTD(rev)},{label:“預估毛利”,value:fmtNTD(profit),color:profit>0?C.positive:profit<0?C.danger:C.ink}]}/>
+</div>;
+})()}
+<button onClick={handleAdd} disabled={!form.productId||!form.qty} style={{width:“100%”,padding:11,background:form.productId&&form.qty?C.deep:“transparent”,border:`1px solid ${form.productId&&form.qty?C.deep:C.light}`,color:form.productId&&form.qty?C.lightest:C.light,fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,fontWeight:700,letterSpacing:“0.08em”,cursor:form.productId&&form.qty?“pointer”:“default”}}>
+記錄此筆銷售
+</button>
+</SecB>
+
+```
+  {/* Summary */}
+  {sortedSales.length>0&&<>
+    <div style={{background:C.ink}}>
+      <div style={{padding:"12px 20px 8px",borderBottom:"1px solid rgba(255,255,255,0.08)",fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.22em",color:C.mid,textTransform:"uppercase"}}>All Time — 累計</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+        <div style={{padding:"12px 16px",borderRight:"1px solid rgba(255,255,255,0.08)"}}>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.mid,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:4}}>累計銷售額</div>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:24,color:C.lightest}}>NT$ {totalRev.toFixed(0)}</div>
+        </div>
+        <div style={{padding:"12px 16px"}}>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.mid,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:4}}>累計毛利</div>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:24,color:totalPro>=0?C.positiveL:C.dangerL}}>NT$ {totalPro.toFixed(0)}</div>
+        </div>
+      </div>
+    </div>
+
+    {/* View toggle */}
+    <div style={{display:"flex",background:C.light,borderBottom:`1px solid ${C.mid}`}}>
+      {[["list","逐筆紀錄"],["monthly","月份統計"]].map(([k,l])=>(
+        <button key={k} onClick={()=>setView(k)} style={{flex:1,padding:"10px 0",border:"none",background:"transparent",fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:view===k?700:400,color:view===k?C.ink:C.deep,borderBottom:`2px solid ${view===k?C.ink:"transparent"}`,cursor:"pointer",letterSpacing:"0.05em"}}>{l}</button>
+      ))}
+    </div>
+
+    {view==="list"&&<div>
+      {sortedSales.map(s=>{
+        const p=getProd(s.productId);
+        const rev=getRevenue(s), profit=getProfit(s);
+        return (
+          <div key={s.id} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,padding:"13px 20px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+              <div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,fontWeight:700}}>{p?.name||"已刪除商品"}</div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.inkFaint,marginTop:2}}>{fmtDate(s.date)} · {s.channel}{s.note?` · ${s.note}`:""}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:18,color:C.ink,lineHeight:1}}>{s.qty} {p?.outputUnit||""}</div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.deep,marginTop:2}}>{fmtNTD(rev)}</div>
+              </div>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:profit>0?C.positive:profit<0?C.danger:C.inkFaint}}>毛利 {fmtNTD(profit)}</div>
+              {confirmDel===s.id
+                ?<div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>{delSale(s.id);setConfirmDel(null);}} style={{padding:"4px 10px",border:`1px solid ${C.dangerL}`,background:"transparent",color:C.dangerL,fontFamily:"'Noto Serif TC',serif",fontSize:10,cursor:"pointer"}}>確認刪除</button>
+                    <button onClick={()=>setConfirmDel(null)} style={{padding:"4px 10px",border:`1px solid ${C.light}`,background:"transparent",color:C.inkFaint,fontFamily:"'Noto Serif TC',serif",fontSize:10,cursor:"pointer"}}>取消</button>
+                  </div>
+                :<button onClick={()=>setConfirmDel(s.id)} style={{background:"none",border:"none",color:C.light,cursor:"pointer",fontFamily:"'Crimson Text',serif",fontSize:16,padding:0,lineHeight:1}}>×</button>
+              }
+            </div>
+          </div>
+        );
+      })}
+    </div>}
+
+    {view==="monthly"&&<div>
+      {Object.entries(byMonth).sort(([a],[b])=>b.localeCompare(a)).map(([month,mSales])=>{
+        const mRev=mSales.reduce((a,s)=>a+getRevenue(s),0);
+        const mPro=mSales.reduce((a,s)=>a+getProfit(s),0);
+        const mQty=mSales.reduce((a,s)=>a+(parseFloat(s.qty)||0),0);
+        return (
+          <div key={month} style={{marginBottom:1}}>
+            <div style={{background:C.lightest,padding:"10px 20px",borderBottom:`1px solid ${C.light}`}}>
+              <div style={{fontFamily:"'Crimson Text',serif",fontSize:14,letterSpacing:"0.06em",color:C.ink}}>{month.replace("-","年")}月</div>
+            </div>
+            <div style={{background:C.white,borderBottom:`1px solid ${C.lightest}`}}>
+              <div style={{padding:"10px 20px"}}>
+                <Grid items={[
+                  {label:"售出件數", value:`${mQty} 件`},
+                  {label:"銷售額",   value:fmtNTD(mRev)},
+                  {label:"毛利",     value:fmtNTD(mPro), color:mPro>=0?C.positive:C.danger},
+                ]}/>
+              </div>
+              {mSales.map(s=>{
+                const p=getProd(s.productId);
+                return (
+                  <div key={s.id} style={{display:"flex",justifyContent:"space-between",padding:"8px 20px",borderTop:`1px solid ${C.lightest}`}}>
+                    <div>
+                      <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:700}}>{p?.name||"已刪除商品"}</div>
+                      <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint,marginTop:1}}>{fmtDate(s.date)} · {s.channel}</div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontFamily:"'Crimson Text',serif",fontSize:14,color:C.ink}}>{s.qty} {p?.outputUnit||""}</div>
+                      <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.deep}}>{fmtNTD(getRevenue(s))}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>}
+  </>}
+</div>
+```
+
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RAW STOCK PAGE
+// ═════════════════════════════════════════════════════════════════════════════
+function RawStockPage({rawStocks,addRaw,updRaw,delRaw}){
+const [expand,setExpand]=useState(null);
+const totalVal=rawStocks.reduce((s,r)=>{
+const bought=parseFloat(r.totalBought)||0, price=parseFloat(r.totalPrice)||0, cur=parseFloat(r.currentStock)||0;
+if(!bought||!price) return s;
+return s+cur*(price/bought);
+},0);
+
+return (
+<div>
+{/* Summary */}
+<div style={{background:C.ink,padding:“14px 20px 16px”}}>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:10,letterSpacing:“0.22em”,color:C.mid,textTransform:“uppercase”,marginBottom:8}}>Raw Material Overview</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”}}>
+<div><div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.mid,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:4}}>原料種類</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:24,color:C.lightest}}>{rawStocks.length} 種</div></div>
+<div><div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.mid,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:4}}>庫存估計價值</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:24,color:C.lightest}}>NT$ {totalVal.toFixed(0)}</div></div>
+</div>
+</div>
+
+```
+  <SecH title="Ingredients — 原料庫存"/>
+  <SecB pad="12px 20px">
+    {rawStocks.length===0&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,color:C.inkFaint,lineHeight:1.8,marginBottom:16}}>尚無原料紀錄。點下方按鈕新增。</div>}
+    {rawStocks.map((r,i)=>{
+      const bought=parseFloat(r.totalBought)||0, price=parseFloat(r.totalPrice)||0, cur=parseFloat(r.currentStock)||0;
+      const pricePerUnit=bought>0?price/bought:0;
+      const curVal=cur*pricePerUnit;
+      const pct=bought>0?Math.min(100,(cur/bought)*100):0;
+      const low=bought>0&&cur/bought<0.2;
+      return (
+        <div key={r.id} style={{marginBottom:12,border:`1px solid ${C.lightest}`,background:C.white}}>
+          <div onClick={()=>setExpand(expand===r.id?null:r.id)} style={{padding:"12px 14px",cursor:"pointer"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:bought>0?8:0}}>
+              <div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:14,fontWeight:700,color:C.ink}}>{r.name||"未命名原料"}</div>
+                {r.note&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.inkFaint,marginTop:2}}>{r.note}</div>}
+              </div>
+              <div style={{textAlign:"right"}}>
+                {low&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.dangerL,marginBottom:2}}>庫存偏低</div>}
+                {cur===0&&bought>0&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.mid,marginBottom:2}}>已用完</div>}
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:20,lineHeight:1,color:low||cur===0?C.dangerL:C.ink}}>{cur||0} {r.unit}</div>
+              </div>
+            </div>
+            {bought>0&&<>
+              <Bar pct={pct} color={pct>20?C.deep:C.dangerL}/>
+              <Grid items={[
+                {label:"購入總量",  value:`${bought} ${r.unit}`},
+                {label:"目前庫存",  value:`${cur} ${r.unit}`},
+                {label:"單位成本",  value:pricePerUnit>0?`NT$ ${pricePerUnit.toFixed(1)}/${r.unit}`:"—"},
+                {label:"庫存價值",  value:curVal>0?`NT$ ${curVal.toFixed(0)}`:"—"},
+              ]}/>
+            </>}
+          </div>
+          {expand===r.id&&(
+            <div style={{borderTop:`1px solid ${C.lightest}`,padding:"14px 14px 10px",background:C.lightest}}>
+              <Fld label="原料名稱"><input style={IS} value={r.name} onChange={e=>updRaw(r.id,{name:e.target.value})} placeholder="燕麥片"/></Fld>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+                <Fld label="購入總量"><input style={IS} type="number" value={r.totalBought} onChange={e=>updRaw(r.id,{totalBought:e.target.value})} placeholder="1000"/></Fld>
+                <Fld label="單位">
+                  <select style={{...IS,appearance:"none",cursor:"pointer"}} value={r.unit} onChange={e=>updRaw(r.id,{unit:e.target.value})}>
+                    {["g","kg","ml","L","個","包"].map(u=><option key={u}>{u}</option>)}
+                  </select>
+                </Fld>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+                <Fld label="購入金額 NT$"><input style={IS} type="number" value={r.totalPrice} onChange={e=>updRaw(r.id,{totalPrice:e.target.value})} placeholder="200"/></Fld>
+                <Fld label="目前庫存量"><input style={IS} type="number" value={r.currentStock} onChange={e=>updRaw(r.id,{currentStock:e.target.value})} placeholder="500"/></Fld>
+              </div>
+              {r.source==="online"&&<Fld label="購買連結"><input style={IS} value={r.url} onChange={e=>updRaw(r.id,{url:e.target.value})} placeholder="https://..."/></Fld>}
+              <div style={{display:"flex",border:`1px solid ${C.light}`,marginBottom:16}}>
+                {[["online","網購"],["offline","實體"]].map(([v,l])=>(
+                  <button key={v} onClick={()=>updRaw(r.id,{source:v})} style={{flex:1,padding:"6px 0",border:"none",background:r.source===v?C.deep:"transparent",color:r.source===v?C.lightest:C.deep,fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:600,cursor:"pointer"}}>{l}</button>
+                ))}
+              </div>
+              <Fld label="備註"><input style={IS} value={r.note} onChange={e=>updRaw(r.id,{note:e.target.value})} placeholder="選填"/></Fld>
+              {r.source==="online"&&r.url&&<a href={r.url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",marginBottom:12,fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.deep,textDecoration:"underline"}}>前往購買連結</a>}
+              <button onClick={()=>{delRaw(r.id);setExpand(null);}} style={{width:"100%",padding:8,border:`1px solid ${C.light}`,background:"transparent",color:C.inkFaint,fontFamily:"'Noto Serif TC',serif",fontSize:11,cursor:"pointer",letterSpacing:"0.06em"}}>刪除此原料</button>
+            </div>
+          )}
+        </div>
+      );
+    })}
+    <button onClick={()=>{addRaw();}} style={{width:"100%",padding:"11px 0",border:`1px solid ${C.light}`,background:"transparent",color:C.deep,fontFamily:"'Noto Serif TC',serif",fontWeight:700,fontSize:12,cursor:"pointer",letterSpacing:"0.1em",marginTop:4}}>+ 新增原料</button>
+  </SecB>
+</div>
+```
+
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DASHBOARD PAGE
+// ═════════════════════════════════════════════════════════════════════════════
+function DashboardPage({products,sales,onSelect}){
+const getQty=(p)=>sales.filter(s=>s.productId===p.id).reduce((a,s)=>a+(parseFloat(s.qty)||0),0);
+const totalStock=products.reduce((a,p)=>a+(parseFloat(p.stockTotal)||0),0);
+const totalSold=products.reduce((a,p)=>a+getQty(p),0);
+const totalRev=products.reduce((a,p)=>a+getQty(p)*(parseFloat(p.sellPrice)||0),0);
+const totalPro=products.reduce((a,p)=>a+getQty(p)*calcProd(p).profitPerUnit,0);
+const stockVal=products.reduce((a,p)=>{
+const rem=(parseFloat(p.stockTotal)||0)-getQty(p);
+return a+Math.max(0,rem)*calcProd(p).costPerUnit;
+},0);
+
+return (
+<div>
+<div style={{background:C.ink}}>
+<div style={{padding:“12px 20px 8px”,borderBottom:“1px solid rgba(255,255,255,0.08)”,fontFamily:”‘Crimson Text’,serif”,fontSize:10,letterSpacing:“0.22em”,color:C.mid,textTransform:“uppercase”}}>Stock Overview</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,borderBottom:“1px solid rgba(255,255,255,0.08)”}}>
+{[{label:“總庫存件數”,value:`${totalStock} 件`},{label:“已售出件數”,value:`${totalSold} 件`},{label:“剩餘件數”,value:`${totalStock-totalSold} 件`},{label:“庫存成本值”,value:`NT$ ${stockVal.toFixed(0)}`}]
+.map((item,i)=>(
+<div key={i} style={{padding:“11px 16px”,borderRight:i%2===0?“1px solid rgba(255,255,255,0.08)”:“none”,borderBottom:i<2?“1px solid rgba(255,255,255,0.08)”:“none”}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,letterSpacing:“0.1em”,color:C.mid,textTransform:“uppercase”,marginBottom:4}}>{item.label}</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:18,color:C.lightest}}>{item.value}</div>
+</div>
+))}
+</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”}}>
+<div style={{padding:“11px 16px”,borderRight:“1px solid rgba(255,255,255,0.08)”}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.mid,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:4}}>已售總收入</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:22,color:C.lightest}}>NT$ {totalRev.toFixed(0)}</div>
+</div>
+<div style={{padding:“11px 16px”}}>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.mid,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:4}}>已售總毛利</div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:22,color:totalPro>=0?C.positiveL:C.dangerL}}>NT$ {totalPro.toFixed(0)}</div>
+</div>
+</div>
+</div>
+<div style={{padding:“14px 20px 6px”,fontFamily:”‘Crimson Text’,serif”,fontSize:10,letterSpacing:“0.2em”,color:C.deep,textTransform:“uppercase”}}>Per Product — 各商品明細</div>
+{products.map((p,i)=>{
+const soldQty=getQty(p), stock=parseFloat(p.stockTotal)||0, rem=stock-soldQty;
+const s=calcProd(p), soldRev=soldQty*(parseFloat(p.sellPrice)||0), soldPro=soldQty*s.profitPerUnit;
+const pct=stock>0?Math.min(100,(soldQty/stock)*100):0, low=stock>0&&rem<=3;
+return (
+<div key={p.id} onClick={()=>onSelect(p.id)} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,padding:“14px 20px”,cursor:“pointer”}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“flex-start”,marginBottom:stock>0?10:0}}>
+<div>
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:9,letterSpacing:“0.14em”,color:C.deep,textTransform:“uppercase”,marginBottom:2}}>{String(i+1).padStart(2,“0”)} — {p.category}</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:14,fontWeight:700}}>{p.name||“未命名商品”}</div>
+{p.stockNote&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,color:C.inkFaint,marginTop:1}}>{p.stockNote}</div>}
+</div>
+<div style={{textAlign:“right”}}>
+{low&&rem>0&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.dangerL,marginBottom:2}}>庫存偏低</div>}
+{rem<=0&&stock>0&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.mid,marginBottom:2}}>已售罄</div>}
+<div style={{fontFamily:”‘Crimson Text’,serif”,fontSize:22,lineHeight:1,color:rem>3?C.ink:rem>0?C.dangerL:C.mid}}>{stock>0||soldQty>0?rem:”—”}</div>
+<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:9,color:C.deep,marginTop:1}}>剩餘 {p.outputUnit}</div>
+</div>
+</div>
+{stock>0&&<>
+<Bar pct={pct} color={pct>=100?C.mid:C.deep}/>
+<Grid items={[{label:“總庫存”,value:`${stock} ${p.outputUnit}`},{label:“已售”,value:`${soldQty} ${p.outputUnit}`},{label:“售出金額”,value:soldQty>0?fmtNTD(soldRev):”—”},{label:“售出毛利”,value:soldQty>0?fmtNTD(soldPro):”—”,color:soldPro>0?C.positive:soldPro<0?C.danger:C.ink}]}/>
+</>}
+{stock===0&&soldQty===0&&<div style={{fontFamily:”‘Noto Serif TC’,serif”,fontSize:10,color:C.light}}>尚未填寫庫存，點此前往填寫</div>}
+</div>
+);
+})}
+</div>
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REPORT PAGE (with export/print)
+// ═════════════════════════════════════════════════════════════════════════════
+function ReportPage({products,sales,revEntries}){
+const getQty=(p)=>sales.filter(s=>s.productId===p.id).reduce((a,s)=>a+(parseFloat(s.qty)||0),0);
+const all=products.map(p=>({…calcProd(p),product:p,soldQty:getQty(p)}));
+const totalRevBatch=all.reduce((s,a)=>s+a.sell*a.qty,0);
+const totalCost=all.reduce((s,a)=>s+a.totalCost,0);
+const totalProfitBatch=totalRevBatch-totalCost;
+const totalRevActual=all.reduce((s,a)=>s+a.soldQty*(parseFloat(a.product.sellPrice)||0),0);
+const totalProfitActual=all.reduce((s,a)=>s+a.soldQty*a.profitPerUnit,0);
+const [view,setView]=useState(“actual”); // actual | batch
+
+const handlePrint=()=>window.print();
+
+const handleExportCSV=()=>{
+const rows=[
+[“商品名稱”,“類別”,“單件成本”,“單件售價”,“單件毛利”,“利潤率”,“批次數量”,“批次毛利”,“已售數量”,“已售金額”,“已售毛利”],
+…all.map(a=>[
+a.product.name||“未命名”,
+a.product.category,
+a.costPerUnit.toFixed(1),
+a.sell.toFixed(1),
+a.profitPerUnit.toFixed(1),
+`${a.margin.toFixed(1)}%`,
+a.qty,
+(a.profitPerUnit*a.qty).toFixed(0),
+a.soldQty,
+(a.soldQty*(parseFloat(a.product.sellPrice)||0)).toFixed(0),
+(a.soldQty*a.profitPerUnit).toFixed(0),
+])
+];
+const csv=rows.map(r=>r.join(”,”)).join(”\n”);
+const blob=new Blob([”\uFEFF”+csv],{type:“text/csv;charset=utf-8”});
+const url=URL.createObjectURL(blob);
+const a=document.createElement(“a”);
+a.href=url; a.download=“鼠舍損益報表.csv”; a.click();
+URL.revokeObjectURL(url);
+};
+
+return (
+<div>
+{/* Export buttons */}
+<div style={{padding:“14px 20px”,background:C.white,borderBottom:`1px solid ${C.lightest}`,display:“flex”,gap:10}}>
+<button onClick={handleExportCSV} style={{flex:1,padding:“9px 0”,border:`1px solid ${C.deep}`,background:C.deep,color:C.lightest,fontFamily:”‘Noto Serif TC’,serif”,fontSize:11,fontWeight:700,letterSpacing:“0.08em”,cursor:“pointer”}}>匯出 CSV</button>
+<button onClick={handlePrint} style={{flex:1,padding:“9px 0”,border:`1px solid ${C.light}`,background:“transparent”,color:C.deep,fontFamily:”‘Noto Serif TC’,serif”,fontSize:11,fontWeight:700,letterSpacing:“0.08em”,cursor:“pointer”}}>列印報表</button>
+</div>
+
+```
+  {/* Revenue summary from RevenuePage */}
+  {revEntries&&revEntries.length>0&&(()=>{
+    const getAmt=e=>parseFloat(e.amount)||((parseFloat(e.qty)||1)*(parseFloat(e.unitPrice)||0));
+    const revIncome=revEntries.filter(e=>e.type==="income").reduce((s,e)=>s+getAmt(e),0);
+    const revExpense=revEntries.filter(e=>e.type==="expense").reduce((s,e)=>s+getAmt(e),0);
+    const revNet=revIncome-revExpense;
+    // group by month
+    const byMonth={};
+    [...revEntries].sort((a,b)=>b.date.localeCompare(a.date)).forEach(e=>{
+      const m=e.date.slice(0,7);
+      if(!byMonth[m]) byMonth[m]={income:0,expense:0};
+      if(e.type==="income") byMonth[m].income+=getAmt(e); else byMonth[m].expense+=getAmt(e);
+    });
+    return (
+      <div style={{background:C.lightest,padding:"14px 20px 16px",borderBottom:`1px solid ${C.light}`}}>
+        <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.22em",color:C.deep,textTransform:"uppercase",marginBottom:12}}>Revenue Summary — 月結營業額摘要</div>
+        <Grid items={[
+          {label:"累計總收入", value:`NT$ ${revIncome.toFixed(0)}`},
+          {label:"累計總支出", value:`NT$ ${revExpense.toFixed(0)}`},
+          {label:"累計淨收入", value:`NT$ ${revNet.toFixed(0)}`, color:revNet>=0?C.positive:C.danger},
+        ]}/>
+        <div style={{marginTop:12}}>
+          {Object.entries(byMonth).slice(0,3).map(([m,d])=>(
+            <div key={m} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:`1px solid ${C.light}`}}>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,color:C.ink}}>{m.replace("-","年")}月</div>
+              <div style={{display:"flex",gap:16}}>
+                <span style={{fontFamily:"'Crimson Text',serif",fontSize:13,color:C.positive}}>+NT$ {d.income.toFixed(0)}</span>
+                {d.expense>0&&<span style={{fontFamily:"'Crimson Text',serif",fontSize:13,color:C.danger}}>-NT$ {d.expense.toFixed(0)}</span>}
+                <span style={{fontFamily:"'Crimson Text',serif",fontSize:13,color:(d.income-d.expense)>=0?C.positive:C.danger,fontWeight:700}}>NT$ {(d.income-d.expense).toFixed(0)}</span>
+              </div>
+            </div>
+          ))}
+          {Object.keys(byMonth).length>3&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint,marginTop:6,letterSpacing:"0.04em"}}>還有 {Object.keys(byMonth).length-3} 個月份，請至「月結」頁面查看完整紀錄</div>}
+        </div>
+      </div>
+    );
+  })()}
+
+  {/* Overall */}
+  <div style={{background:C.ink}}>
+    <div style={{display:"flex",background:"rgba(0,0,0,0.2)",borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+      {[["actual","實際銷售"],["batch","批次預估"]].map(([k,l])=>(
+        <button key={k} onClick={()=>setView(k)} style={{flex:1,padding:"10px 0",border:"none",background:"transparent",fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:view===k?700:400,color:view===k?C.lightest:C.mid,borderBottom:`2px solid ${view===k?C.lightest:"transparent"}`,cursor:"pointer",letterSpacing:"0.05em"}}>{l}</button>
+      ))}
+    </div>
+    <div style={{padding:"16px 20px 18px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:14}}>
+        <div>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.1em",color:C.mid,textTransform:"uppercase",marginBottom:5}}>{view==="actual"?"已售總毛利":"批次總毛利（預估）"}</div>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:36,lineHeight:1,color:(view==="actual"?totalProfitActual:totalProfitBatch)>=0?C.positiveL:C.dangerL}}>NT$ {(view==="actual"?totalProfitActual:totalProfitBatch).toFixed(0)}</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.1em",color:C.mid,textTransform:"uppercase",marginBottom:5}}>利潤率</div>
+          <div style={{fontFamily:"'Crimson Text',serif",fontSize:28,lineHeight:1,color:C.positiveL}}>
+            {view==="actual"?(totalRevActual>0?`${((totalProfitActual/totalRevActual)*100).toFixed(1)}%`:"—"):(totalRevBatch>0?`${((totalProfitBatch/totalRevBatch)*100).toFixed(1)}%`:"—")}
+          </div>
+        </div>
+      </div>
+      <div style={{height:1,background:"rgba(255,255,255,0.08)",marginBottom:14}}/>
+      <Grid dark items={view==="actual"?[
+        {label:"已售總收入", value:`NT$ ${totalRevActual.toFixed(0)}`},
+        {label:"已售總成本", value:`NT$ ${all.reduce((s,a)=>s+a.soldQty*a.costPerUnit,0).toFixed(0)}`},
+      ]:[
+        {label:"預估總收入", value:`NT$ ${totalRevBatch.toFixed(0)}`},
+        {label:"預估總成本", value:`NT$ ${totalCost.toFixed(0)}`},
+      ]}/>
+    </div>
+  </div>
+
+  {/* Per product */}
+  <div style={{padding:"14px 20px 6px",fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.2em",color:C.deep,textTransform:"uppercase"}}>Per Product — 各商品損益</div>
+  {all.map(({product:p,profitPerUnit,margin,costPerUnit,sell,qty,soldQty},i)=>{
+    const soldRev=soldQty*(parseFloat(p.sellPrice)||0), soldPro=soldQty*profitPerUnit;
+    return (
+      <div key={p.id} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,padding:"14px 20px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+          <div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:9,letterSpacing:"0.14em",color:C.deep,textTransform:"uppercase",marginBottom:2}}>{String(i+1).padStart(2,"0")} — {p.category}</div>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:15,fontWeight:700}}>{p.name||"未命名商品"}</div>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:10,color:C.inkFaint,marginTop:2}}>{p.outputQty||"—"} {p.outputUnit}</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.deep,textTransform:"uppercase",marginBottom:2}}>單件毛利</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:22,lineHeight:1,color:profitPerUnit>0?C.positive:profitPerUnit<0?C.danger:C.inkFaint}}>{profitPerUnit>0?"+":""}{fmtNTD1(profitPerUnit)}</div>
+          </div>
+        </div>
+        {p.sellPrice&&p.outputQty&&<>
+          <Grid items={[
+            {label:"成本",   value:fmtNTD1(costPerUnit)},
+            {label:"售價",   value:fmtNTD1(sell)},
+            {label:"利潤率", value:isNaN(margin)?"—":`${margin.toFixed(1)}%`, color:margin>=20?C.positive:margin<0?C.danger:C.ink},
+            {label:"批次毛利",value:fmtNTD((profitPerUnit*qty)), color:profitPerUnit*qty>0?C.positive:profitPerUnit*qty<0?C.danger:C.ink},
+          ]}/>
+          {soldQty>0&&<div style={{marginTop:8}}>
+            <Grid items={[
+              {label:"已售數量", value:`${soldQty} ${p.outputUnit}`},
+              {label:"已售金額", value:fmtNTD(soldRev)},
+              {label:"已售毛利", value:fmtNTD(soldPro), color:soldPro>0?C.positive:soldPro<0?C.danger:C.ink},
+            ]}/>
+          </div>}
+        </>}
+      </div>
+    );
+  })}
+</div>
+```
+
+);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REVENUE PAGE — 月結營業額
+// ═════════════════════════════════════════════════════════════════════════════
+function RevenuePage({revEntries,addRevEntry,delRevEntry}){
+const [form,setForm] = useState({date:today(),category:“鼠鼠販售”,item:””,qty:“1”,unitPrice:””,note:””,type:“income”});
+const [view,setView] = useState(“month”); // month | year | list
+const [confirmDel,setConfirmDel] = useState(null);
+const [expandMonth,setExpandMonth] = useState(null);
+
+const setF = patch => setForm(f=>({…f,…patch}));
+const amount = (parseFloat(form.qty)||0)*(parseFloat(form.unitPrice)||0);
+
+const handleAdd = () => {
+if(!form.item||!form.unitPrice||!form.date) return;
+const type = INCOME_CATS.includes(form.category)?“income”:“expense”;
+addRevEntry({…form, type, amount:(parseFloat(form.qty)||1)*(parseFloat(form.unitPrice)||0)});
+setForm(f=>({…f, item:””, qty:“1”, unitPrice:””, note:””}));
+};
+
+const getAmt = e => parseFloat(e.amount)||( (parseFloat(e.qty)||1)*(parseFloat(e.unitPrice)||0) );
+
+// group by month
+const sorted = […revEntries].sort((a,b)=>b.date.localeCompare(a.date));
+const byMonth = {};
+sorted.forEach(e=>{
+const m=e.date.slice(0,7);
+if(!byMonth[m]) byMonth[m]={income:0,expense:0,entries:[]};
+const a=getAmt(e);
+if(e.type===“income”) byMonth[m].income+=a; else byMonth[m].expense+=a;
+byMonth[m].entries.push(e);
+});
+
+// group by year
+const byYear = {};
+Object.entries(byMonth).forEach(([m,data])=>{
+const y=m.slice(0,4);
+if(!byYear[y]) byYear[y]={income:0,expense:0,months:{}};
+byYear[y].income+=data.income;
+byYear[y].expense+=data.expense;
+byYear[y].months[m]=data;
+});
+
+const allIncome  = sorted.filter(e=>e.type===“income”).reduce((s,e)=>s+getAmt(e),0);
+const allExpense = sorted.filter(e=>e.type===“expense”).reduce((s,e)=>s+getAmt(e),0);
+const allNet     = allIncome-allExpense;
+
+// By category totals
+const byCat = {};
+sorted.forEach(e=>{
+if(!byCat[e.category]) byCat[e.category]={total:0,type:e.type};
+byCat[e.category].total+=getAmt(e);
+});
+
+const exportCSV = (scope) => {
+let rows=[[“日期”,“類別”,“項目”,“數量”,“單價”,“金額”,“類型”,“備註”]];
+const ents = scope===“all” ? sorted :
+scope===“year” ? sorted.filter(e=>e.date.startsWith(expandMonth?.slice(0,4)||””)) :
+sorted.filter(e=>e.date.startsWith(expandMonth||””));
+ents.forEach(e=>rows.push([
+e.date, e.category, e.item, e.qty||1, e.unitPrice,
+getAmt(e).toFixed(0), e.type===“income”?“收入”:“支出”, e.note||””
+]));
+const csv=rows.map(r=>r.join(”,”)).join(”\n”);
+const blob=new Blob([”\uFEFF”+csv],{type:“text/csv;charset=utf-8”});
+const url=URL.createObjectURL(blob);
+const a=document.createElement(“a”); a.href=url;
+a.download=`鼠舍營業額_${scope==="all"?"全部":expandMonth||""}.csv`;
+a.click(); URL.revokeObjectURL(url);
+};
+
+const CAT_COLORS = {“鼠鼠販售”:C.positiveL,“主食糧”:”#a8c5b5”,“零食點心”:”#c5b8a8”,“用品墊材”:C.mid,“其他收入”:C.deep,“原料支出”:C.dangerL,“包材支出”:”#c4a07e”,“其他支出”:”#b0a0a0”};
+
+return (
+<div>
+{/* ── Add Entry ── */}
+<SecH title="New Entry — 新增紀錄"/>
+<SecB>
+{/* Type toggle */}
+<div style={{display:“flex”,border:`1px solid ${C.light}`,marginBottom:16}}>
+{[[“income”,“收入”],[“expense”,“支出”]].map(([t,l])=>(
+<button key={t} onClick={()=>{ setF({type:t,category:t===“income”?“鼠鼠販售”:“原料支出”}); }} style={{flex:1,padding:“8px 0”,border:“none”,background:form.type===t?C.deep:“transparent”,color:form.type===t?C.lightest:C.deep,fontFamily:”‘Noto Serif TC’,serif”,fontSize:12,fontWeight:700,cursor:“pointer”,letterSpacing:“0.06em”}}>{l}</button>
+))}
+</div>
+
+```
+    <Fld label="類別">
+      <select style={{...IS,appearance:"none",cursor:"pointer"}} value={form.category} onChange={e=>setF({category:e.target.value,type:INCOME_CATS.includes(e.target.value)?"income":"expense"})}>
+        <optgroup label="── 收入 ──">{INCOME_CATS.map(c=><option key={c}>{c}</option>)}</optgroup>
+        <optgroup label="── 支出 ──">{EXPENSE_CATS.map(c=><option key={c}>{c}</option>)}</optgroup>
+      </select>
+    </Fld>
+    <Fld label="項目說明">
+      <input style={IS} placeholder={form.category==="鼠鼠販售"?"例：布丁鼠 三線鼠 幼鼠一隻":form.category==="主食糧"?"例：鼠皇御用糧 100g":"請填寫項目"} value={form.item} onChange={e=>setF({item:e.target.value})}/>
+    </Fld>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+      <Fld label="數量"><input style={IS} type="number" placeholder="1" value={form.qty} onChange={e=>setF({qty:e.target.value})}/></Fld>
+      <Fld label="單價 NT$"><input style={IS} type="number" placeholder="0" value={form.unitPrice} onChange={e=>setF({unitPrice:e.target.value})}/></Fld>
+      <Fld label="日期"><input style={IS} type="date" value={form.date} onChange={e=>setF({date:e.target.value})}/></Fld>
+    </div>
+    <Fld label="備註"><input style={IS} placeholder="選填" value={form.note} onChange={e=>setF({note:e.target.value})}/></Fld>
+    {form.item&&form.unitPrice&&(
+      <div style={{background:C.lightest,padding:"9px 14px",marginTop:-8,marginBottom:12}}>
+        <Grid items={[
+          {label:"小計金額", value:`NT$ ${amount.toFixed(0)}`, size:16},
+          {label:"類型",     value:form.type==="income"?"收入":"支出", color:form.type==="income"?C.positive:C.danger, size:16},
+        ]}/>
+      </div>
+    )}
+    <button onClick={handleAdd} disabled={!form.item||!form.unitPrice} style={{width:"100%",padding:11,background:form.item&&form.unitPrice?C.deep:"transparent",border:`1px solid ${form.item&&form.unitPrice?C.deep:C.light}`,color:form.item&&form.unitPrice?C.lightest:C.light,fontFamily:"'Noto Serif TC',serif",fontSize:12,fontWeight:700,letterSpacing:"0.08em",cursor:form.item&&form.unitPrice?"pointer":"default"}}>
+      記錄此筆
+    </button>
+  </SecB>
+
+  {revEntries.length>0&&<>
+    {/* ── All-time summary ── */}
+    <div style={{background:C.ink}}>
+      <div style={{padding:"12px 20px 8px",borderBottom:"1px solid rgba(255,255,255,0.08)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.22em",color:C.mid,textTransform:"uppercase"}}>All Time — 累計總覽</div>
+        <button onClick={()=>exportCSV("all")} style={{background:"none",border:`1px solid rgba(255,255,255,0.2)`,color:C.mid,fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.08em",padding:"4px 10px",cursor:"pointer"}}>匯出全部 CSV</button>
+      </div>
+      <div style={{padding:"14px 20px 16px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:14}}>
+          <div>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.1em",color:C.mid,textTransform:"uppercase",marginBottom:5}}>累計淨收入</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:36,lineHeight:1,color:allNet>=0?C.positiveL:C.dangerL}}>NT$ {allNet.toFixed(0)}</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.mid,textTransform:"uppercase",marginBottom:5}}>筆數</div>
+            <div style={{fontFamily:"'Crimson Text',serif",fontSize:24,color:C.lightest}}>{revEntries.length}</div>
+          </div>
+        </div>
+        <div style={{height:1,background:"rgba(255,255,255,0.08)",marginBottom:12}}/>
+        <Grid dark items={[
+          {label:"累計總收入", value:`NT$ ${allIncome.toFixed(0)}`},
+          {label:"累計總支出", value:`NT$ ${allExpense.toFixed(0)}`},
+        ]}/>
+      </div>
+    </div>
+
+    {/* ── Category breakdown ── */}
+    <SecH title="By Category — 類別分佈"/>
+    <SecB>
+      {Object.entries(byCat).sort(([,a],[,b])=>b.total-a.total).map(([cat,data])=>{
+        const maxTotal=Math.max(...Object.values(byCat).map(d=>d.total));
+        const pct=maxTotal>0?(data.total/maxTotal)*100:0;
+        return (
+          <div key={cat} style={{marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,fontWeight:700,color:C.ink}}>{cat}</div>
+              <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:data.type==="income"?C.positive:C.danger,letterSpacing:"0.06em"}}>{data.type==="income"?"收入":"支出"}</div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:15,color:C.ink}}>NT$ {data.total.toFixed(0)}</div>
+              </div>
+            </div>
+            <div style={{height:4,background:C.lightest,borderRadius:2,overflow:"hidden"}}>
+              <div style={{height:"100%",width:`${pct}%`,background:CAT_COLORS[cat]||C.deep,borderRadius:2}}/>
+            </div>
+          </div>
+        );
+      })}
+    </SecB>
+
+    {/* ── View toggle ── */}
+    <div style={{display:"flex",background:C.light,borderBottom:`1px solid ${C.mid}`}}>
+      {[["month","月份報表"],["year","年度報表"],["list","逐筆明細"]].map(([k,l])=>(
+        <button key={k} onClick={()=>setView(k)} style={{flex:1,padding:"10px 0",border:"none",background:"transparent",fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:view===k?700:400,color:view===k?C.ink:C.deep,borderBottom:`2px solid ${view===k?C.ink:"transparent"}`,cursor:"pointer",letterSpacing:"0.04em"}}>{l}</button>
+      ))}
+    </div>
+
+    {/* ── MONTH VIEW ── */}
+    {view==="month"&&Object.entries(byMonth).sort(([a],[b])=>b.localeCompare(a)).map(([month,data])=>{
+      const net=data.income-data.expense;
+      const isOpen=expandMonth===month;
+      return (
+        <div key={month} style={{marginBottom:1}}>
+          <div onClick={()=>setExpandMonth(isOpen?null:month)} style={{background:isOpen?C.ink:C.white,padding:"14px 20px",cursor:"pointer",borderBottom:`1px solid ${C.lightest}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+              <div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.2em",color:isOpen?C.mid:C.deep,textTransform:"uppercase",marginBottom:3}}>Monthly Report</div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:16,fontWeight:700,color:isOpen?C.lightest:C.ink}}>
+                  {month.replace("-","年")}月
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:isOpen?C.mid:C.deep,textTransform:"uppercase",marginBottom:3}}>淨收入</div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:22,lineHeight:1,color:net>=0?(isOpen?C.positiveL:C.positive):(isOpen?C.dangerL:C.danger)}}>NT$ {net.toFixed(0)}</div>
+              </div>
+            </div>
+            <Grid dark={isOpen} items={[
+              {label:"收入", value:`NT$ ${data.income.toFixed(0)}`},
+              {label:"支出", value:`NT$ ${data.expense.toFixed(0)}`},
+              {label:"筆數", value:`${data.entries.length} 筆`},
+            ]}/>
+          </div>
+          {isOpen&&(
+            <div style={{borderBottom:`1px solid ${C.lightest}`}}>
+              <div style={{display:"flex",justifyContent:"flex-end",padding:"8px 20px",background:C.lightest,borderBottom:`1px solid ${C.light}`}}>
+                <button onClick={()=>exportCSV("month")} style={{background:"none",border:`1px solid ${C.deep}`,color:C.deep,fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.08em",padding:"4px 12px",cursor:"pointer"}}>匯出本月 CSV</button>
+              </div>
+              {/* By category in month */}
+              {(()=>{
+                const catMap={};
+                data.entries.forEach(e=>{ if(!catMap[e.category]) catMap[e.category]={total:0,type:e.type,entries:[]}; catMap[e.category].total+=getAmt(e); catMap[e.category].entries.push(e); });
+                return Object.entries(catMap).map(([cat,cd])=>(
+                  <div key={cat}>
+                    <div style={{display:"flex",justifyContent:"space-between",padding:"9px 20px",background:"#f7f5f2",borderBottom:`1px solid ${C.lightest}`}}>
+                      <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:11,fontWeight:700,color:C.ink}}>{cat}</div>
+                      <div style={{fontFamily:"'Crimson Text',serif",fontSize:14,color:cd.type==="income"?C.positive:C.danger}}>NT$ {cd.total.toFixed(0)}</div>
+                    </div>
+                    {cd.entries.map(e=>(
+                      <div key={e.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 20px 9px 32px",borderBottom:`1px solid ${C.lightest}`,background:C.white}}>
+                        <div style={{flex:1}}>
+                          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:12,fontWeight:700,color:C.ink}}>{e.item}</div>
+                          <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint,marginTop:1}}>
+                            {fmtDate(e.date)}{e.qty&&e.qty!=="1"?` · 數量 ${e.qty}`:""}{e.note?` · ${e.note}`:""}
+                          </div>
+                        </div>
+                        <div style={{display:"flex",gap:12,alignItems:"center"}}>
+                          <div style={{textAlign:"right"}}>
+                            <div style={{fontFamily:"'Crimson Text',serif",fontSize:15,color:e.type==="income"?C.positive:C.danger}}>NT$ {getAmt(e).toFixed(0)}</div>
+                            {(parseFloat(e.qty)||1)>1&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint}}>單價 NT$ {parseFloat(e.unitPrice).toFixed(0)}</div>}
+                          </div>
+                          {confirmDel===e.id
+                            ?<div style={{display:"flex",gap:6}}>
+                                <button onClick={()=>{delRevEntry(e.id);setConfirmDel(null);}} style={{padding:"3px 8px",border:`1px solid ${C.dangerL}`,background:"transparent",color:C.dangerL,fontFamily:"'Noto Serif TC',serif",fontSize:9,cursor:"pointer"}}>刪除</button>
+                                <button onClick={()=>setConfirmDel(null)} style={{padding:"3px 8px",border:`1px solid ${C.light}`,background:"transparent",color:C.inkFaint,fontFamily:"'Noto Serif TC',serif",fontSize:9,cursor:"pointer"}}>取消</button>
+                              </div>
+                            :<button onClick={()=>setConfirmDel(e.id)} style={{background:"none",border:"none",color:C.light,cursor:"pointer",fontFamily:"'Crimson Text',serif",fontSize:16,padding:0,lineHeight:1}}>×</button>
+                          }
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ));
+              })()}
+            </div>
+          )}
+        </div>
+      );
+    })}
+
+    {/* ── YEAR VIEW ── */}
+    {view==="year"&&Object.entries(byYear).sort(([a],[b])=>b.localeCompare(a)).map(([year,data])=>{
+      const net=data.income-data.expense;
+      const isOpen=expandMonth===year;
+      return (
+        <div key={year} style={{marginBottom:1}}>
+          <div onClick={()=>setExpandMonth(isOpen?null:year)} style={{background:isOpen?C.ink:C.white,padding:"16px 20px",cursor:"pointer",borderBottom:`1px solid ${C.lightest}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:10,letterSpacing:"0.2em",color:isOpen?C.mid:C.deep,textTransform:"uppercase",marginBottom:3}}>Annual Report</div>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:20,fontWeight:700,color:isOpen?C.lightest:C.ink}}>{year} 年</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:isOpen?C.mid:C.deep,textTransform:"uppercase",marginBottom:3}}>年度淨收入</div>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:28,lineHeight:1,color:net>=0?(isOpen?C.positiveL:C.positive):(isOpen?C.dangerL:C.danger)}}>NT$ {net.toFixed(0)}</div>
+              </div>
+            </div>
+            <Grid dark={isOpen} items={[
+              {label:"年度總收入", value:`NT$ ${data.income.toFixed(0)}`},
+              {label:"年度總支出", value:`NT$ ${data.expense.toFixed(0)}`},
+              {label:"月份數",     value:`${Object.keys(data.months).length} 個月`},
+            ]}/>
+          </div>
+          {isOpen&&(
+            <div style={{borderBottom:`1px solid ${C.lightest}`}}>
+              <div style={{display:"flex",justifyContent:"flex-end",padding:"8px 20px",background:C.lightest,borderBottom:`1px solid ${C.light}`}}>
+                <button onClick={()=>exportCSV("year")} style={{background:"none",border:`1px solid ${C.deep}`,color:C.deep,fontFamily:"'Noto Serif TC',serif",fontSize:9,letterSpacing:"0.08em",padding:"4px 12px",cursor:"pointer"}}>匯出本年 CSV</button>
+              </div>
+              {Object.entries(data.months).sort(([a],[b])=>b.localeCompare(a)).map(([month,mdata])=>{
+                const mnet=mdata.income-mdata.expense;
+                return (
+                  <div key={month} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,padding:"12px 20px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                      <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:13,fontWeight:700,color:C.ink}}>{month.slice(5)}月</div>
+                      <div style={{fontFamily:"'Crimson Text',serif",fontSize:17,color:mnet>=0?C.positive:C.danger}}>NT$ {mnet.toFixed(0)}</div>
+                    </div>
+                    <Grid items={[
+                      {label:"收入", value:`NT$ ${mdata.income.toFixed(0)}`},
+                      {label:"支出", value:`NT$ ${mdata.expense.toFixed(0)}`},
+                      {label:"筆數", value:`${mdata.entries.length} 筆`},
+                    ]}/>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    })}
+
+    {/* ── LIST VIEW ── */}
+    {view==="list"&&<div>
+      {sorted.map(e=>(
+        <div key={e.id} style={{background:C.white,borderBottom:`1px solid ${C.lightest}`,padding:"12px 20px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:2}}>
+                <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,padding:"2px 7px",background:e.type==="income"?`${C.positive}22`:`${C.danger}22`,color:e.type==="income"?C.positive:C.danger,letterSpacing:"0.06em"}}>{e.category}</div>
+              </div>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:13,fontWeight:700,color:C.ink}}>{e.item}</div>
+              <div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint,marginTop:2}}>
+                {fmtDate(e.date)}{e.qty&&e.qty!=="1"?` · 數量 ${e.qty}`:""}{e.note?` · ${e.note}`:""}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:12,alignItems:"center"}}>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontFamily:"'Crimson Text',serif",fontSize:17,color:e.type==="income"?C.positive:C.danger}}>NT$ {getAmt(e).toFixed(0)}</div>
+                {(parseFloat(e.qty)||1)>1&&<div style={{fontFamily:"'Noto Serif TC',serif",fontSize:9,color:C.inkFaint}}>× {e.qty} 件 @ NT$ {parseFloat(e.unitPrice).toFixed(0)}</div>}
+              </div>
+              {confirmDel===e.id
+                ?<div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>{delRevEntry(e.id);setConfirmDel(null);}} style={{padding:"3px 8px",border:`1px solid ${C.dangerL}`,background:"transparent",color:C.dangerL,fontFamily:"'Noto Serif TC',serif",fontSize:9,cursor:"pointer"}}>刪除</button>
+                    <button onClick={()=>setConfirmDel(null)} style={{padding:"3px 8px",border:`1px solid ${C.light}`,background:"transparent",color:C.inkFaint,fontFamily:"'Noto Serif TC',serif",fontSize:9,cursor:"pointer"}}>取消</button>
+                  </div>
+                :<button onClick={()=>setConfirmDel(e.id)} style={{background:"none",border:"none",color:C.light,cursor:"pointer",fontFamily:"'Crimson Text',serif",fontSize:16,padding:0,lineHeight:1}}>×</button>
+              }
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>}
+  </>}
+</div>
+```
+
+);
+}
